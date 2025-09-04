@@ -166,10 +166,11 @@ void logLowFreqFields() {
   debugPrintln("logLowFreqFields: Getting BME readings");
 
   // TODO - Uncomment and use BME readings
-  //rec.temp     = int16_t(bme.readTemperature() * 10);            // ×10 fixed-point
-  //float p_hPa = bme.readPressure() / 100.0f;
-  //rec.pressure = int16_t(p_hPa * 10);
-  //rec.humidity = int16_t(bme.readHumidity() * 10);
+  bme.performReading();
+  rec.temp     = int16_t(bme.temperature * 10);            // ×10 fixed-point
+  float p_hPa = bme.pressure / 100.0f;
+  rec.pressure = int16_t(p_hPa * 10);
+  rec.humidity = int16_t(bme.humidity * 10);
 
   debugPrint("Temperature: ");
   debugPrint(rec.temp / 10.0); // Print temperature in °C
