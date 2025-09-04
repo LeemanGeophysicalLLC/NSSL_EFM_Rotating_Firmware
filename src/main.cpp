@@ -8,13 +8,14 @@
 #include "pins.h"
 #include "IWatchdog.h"
 #include "ADS131M04.h"
+#include "SparkFun_u-blox_GNSS_Arduino_Library.h"
 
 // Uncomment to enable debug prints
-#define DEBUG_PRINT_ENABLE
+//#define DEBUG_PRINT_ENABLE
+#define WAIT_ON_GPS_FIX // only disabled for testing purposes
 //#define WATCHDOG_ENABLE
 
 #define DEBUG_BAUD 115200
-#define GPS_BAUD_START   9600
 #define GPS_BAUD        115200
 const uint32_t SPI_SPEED = SD_SCK_MHZ(18);
 
@@ -37,6 +38,7 @@ Adafruit_BME680   bme;
 ICM_20948_I2C     imu;
 File              logFile;
 ADS131M04 adc;
+SFE_UBLOX_GNSS myGNSS;
 
 volatile uint8_t adcSampleCnt = 0;
 
@@ -45,20 +47,34 @@ template<typename T, size_t N>
 struct CircularBuffer {
   T      buf[N];
   size_t head = 0, tail = 0;
-  bool   isEmpty() const { return head == tail; }
-  bool   isFull()  const { return ((head+1)%N) == tail; }
-  void   push(const T &v) {
-    buf[head] = v;
-    head = (head+1)%N;
-    if (head == tail) tail = (tail+1)%N;  // overwrite oldest
+
+  bool isEmpty() const { 
+    return head == tail; 
   }
-  bool   pop(T &out) {
-    if (isEmpty()) return false;
+  bool isFull()  const { 
+    return ((head + 1) % N) == tail; 
+  }
+
+  void push(const T &v) {
+    buf[head] = v;
+    head = (head + 1) % N;
+    if (head == tail)            // buffer overflow → drop oldest
+      tail = (tail + 1) % N;
+  }
+
+  bool pop(T &out) {
+    if (isEmpty()) return false; // nothing to retrieve
     out = buf[tail];
-    tail = (tail+1)%N;
+    tail = (tail + 1) % N;
     return true;
   }
+
+  size_t size() const {
+    // number of elements stored
+    return (head + N - tail) % N;
+  }
 };
+
 
 // ==================== Record Types ====================
 enum RecordType : uint8_t { REC_HF=1, REC_LF=2 };
@@ -119,7 +135,7 @@ struct RuntimeStatus {
 RuntimeStatus runtime;
 
 // Buffer for up to 256 entries
-static CircularBuffer<LogEntry, 10> logBuf;
+static CircularBuffer<LogEntry, 128> logBuf;
 
 // Raw ADC storage
 static uint32_t rawAdc[4];
@@ -127,78 +143,11 @@ static uint32_t rawAdc[4];
 // Timing
 static uint32_t lastLfLogMs = 0;
 
-// Wait for a UBX-ACK-ACK for the given class/id, up to timeoutMs milliseconds.
-// Returns true if ACK received, false otherwise.
-bool waitForAck(uint8_t ackClass, uint8_t ackId, uint16_t timeoutMs) {
-  enum AckState { SYNC1, SYNC2, CLASS, ID, LEN1, LEN2, PL1, PL2, CK_A, CK_B };
-  AckState state = SYNC1;
-  uint8_t ckA = 0, ckB = 0;
-  uint8_t lenL = 0, lenH = 0;
-  uint8_t payloadClass = 0, payloadId = 0;
-  uint32_t start = millis();
-
-  while (millis() - start < timeoutMs) {
-    if (!SerGPS.available()) continue;
-    uint8_t b = SerGPS.read();
-
-    switch (state) {
-      case SYNC1:
-        if (b == 0xB5) state = SYNC2;
-        break;
-      case SYNC2:
-        if (b == 0x62) state = CLASS;
-        else state = SYNC1;
-        break;
-      case CLASS:
-        if (b == 0x05) { ckA = b; ckB = ckA; state = ID; }
-        else state = SYNC1;
-        break;
-      case ID:
-        if (b == 0x01) { ckA += b; ckB += ckA; state = LEN1; }
-        else state = SYNC1;
-        break;
-      case LEN1:
-        lenL = b;
-        if (lenL == 2) { ckA += b; ckB += ckA; state = LEN2; }
-        else state = SYNC1;
-        break;
-      case LEN2:
-        lenH = b;
-        if (lenH == 0) { ckA += b; ckB += ckA; state = PL1; }
-        else state = SYNC1;
-        break;
-      case PL1:
-        payloadClass = b;
-        ckA += b; ckB += ckA;
-        state = PL2;
-        break;
-      case PL2:
-        payloadId = b;
-        ckA += b; ckB += ckA;
-        state = CK_A;
-        break;
-      case CK_A:
-        if (b == ckA) state = CK_B;
-        else state = SYNC1;
-        break;
-      case CK_B:
-        if (b == ckB) {
-          // got a complete ACK-ACK; check that it's for our message
-          if (payloadClass == ackClass && payloadId == ackId) {
-            return true;
-          }
-        }
-        state = SYNC1;
-        break;
-    }
-  }
-  return false;
-}
-
 // ------------------------------------------------------
 // Low-frequency sampling (1 Hz): GPS + BME → LFRecord
 // ------------------------------------------------------
 void logLowFreqFields() {
+  debugPrintln("logLowFreqFields: Starting LF record logging");
   // 1) Build a fresh LFRecord
   LFRecord rec{};
   rec.pps_utc   = runtime.lastUTC;
@@ -206,6 +155,7 @@ void logLowFreqFields() {
   rec.processor_ms = millis();
 
   // 2) GPS position & altitude (TinyGPS++)
+  debugPrintln("logLowFreqFields: Getting GPS position and altitude");
   double lat_d = gps.location.lat();
   double lon_d = gps.location.lng();
   rec.lat      = int32_t(lat_d * 1e5);              // ×1e5 fixed-point
@@ -213,11 +163,13 @@ void logLowFreqFields() {
   rec.alt      = uint16_t(gps.altitude.meters() + 0.5);  // metres
 
   // 3) BME280 readings (Adafruit_BME280)
-  bme.performReading();
-  rec.temp     = int16_t(bme.temperature * 10);            // ×10 fixed-point
-  float p_hPa = bme.readPressure() / 100.0f;
-  rec.pressure = int16_t(p_hPa * 10);
-  rec.humidity = int16_t(bme.humidity * 10);
+  debugPrintln("logLowFreqFields: Getting BME readings");
+
+  // TODO - Uncomment and use BME readings
+  //rec.temp     = int16_t(bme.readTemperature() * 10);            // ×10 fixed-point
+  //float p_hPa = bme.readPressure() / 100.0f;
+  //rec.pressure = int16_t(p_hPa * 10);
+  //rec.humidity = int16_t(bme.readHumidity() * 10);
 
   debugPrint("Temperature: ");
   debugPrint(rec.temp / 10.0); // Print temperature in °C
@@ -433,6 +385,7 @@ bool initBME()
 {
   if (bme.begin(0x76)) {
     // Set up oversampling and filter initialization
+    bme.setGasHeater(0, 0); 
     bme.setTemperatureOversampling(BME680_OS_8X);
     bme.setHumidityOversampling(BME680_OS_2X);
     bme.setPressureOversampling(BME680_OS_4X);
@@ -445,250 +398,86 @@ bool initBME()
   return true;
 }
 
-void sendUBX(const uint8_t *msg, uint16_t len) {
-  uint8_t ckA = 0, ckB = 0;
-  // checksum over class, id, length and payload (bytes 2..len-1)
-  for (uint16_t i = 2; i < len; i++) {
-    ckA += msg[i];
-    ckB += ckA;
-  }
-  SerGPS.write(msg, len);
-  SerGPS.write(ckA);
-  SerGPS.write(ckB);
-}
-
- 
-/**
- * @brief Waits for a UBX-ACK-ACK for the given message (by class & id).
- *
- * @param MSG  Pointer to the original UBX message header (at least 4 bytes: [sync1, sync2, class, id, ...])
- * @return true  if a matching ACK-ACK is received within the timeout
- * @return false on timeout or mismatch
- */
-bool getUBX_ACK(const uint8_t *MSG) {
-  // Build the expected 10-byte ACK packet:
-  // [0]  = 0xB5, [1] = 0x62, [2]=0x05, [3]=0x01, [4]=0x02, [5]=0x00,
-  // [6] = MSG[2] (class), [7] = MSG[3] (id), [8]=CK_A, [9]=CK_B
-  uint8_t ack[10];
-  ack[0] = 0xB5;
-  ack[1] = 0x62;
-  ack[2] = 0x05;   // ACK class
-  ack[3] = 0x01;   // ACK id
-  ack[4] = 0x02;   // payload length LSB
-  ack[5] = 0x00;   // payload length MSB
-  ack[6] = MSG[2];
-  ack[7] = MSG[3];
-
-  // Calculate checksum over ack[2..7]
-  ack[8] = 0;
-  ack[9] = 0;
-  for (int i = 2; i < 8; i++) {
-    ack[8] += ack[i];
-    ack[9] += ack[8];
-  }
-
-  // Now scan incoming bytes for an exact 10-byte match
-  uint8_t idx = 0;
-  uint32_t start = millis();
-  const uint32_t timeout = 1000;  // ms
-
-  while (millis() - start < timeout) {
-    if (!SerGPS.available()) continue;
-    uint8_t b = SerGPS.read();
-
-    if (b == ack[idx]) {
-      idx++;
-      if (idx == 10) {
-        // got full match
-        return true;
-      }
-    } else {
-      // mismatch: if this byte is the first sync, restart idx=1, else idx=0
-      idx = (b == ack[0]) ? 1 : 0;
-    }
-  }
-
-  // timed out
-  return false;
-}
-
-
-bool setDynamicMode6()
-{
-  /*
-   * Sets up the GPS in high altitude dynamic mode 6.
-   */
-  static byte gps_set_sucess = 0 ;
-  uint8_t setNav[] = {0xB5, 0x62, 0x06, 0x24, 0x24, 0x00, 0xFF, 0xFF, 0x06, 0x03, 0x00,
-                      0x00, 0x00, 0x00, 0x10, 0x27, 0x00, 0x00, 0x05, 0x00, 0xFA, 0x00,
-                      0xFA, 0x00, 0x64, 0x00, 0x2C, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
-                      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x16, 0xDC };
-  uint32_t start_millis = millis();
-  while(!gps_set_sucess)
-  {
-    sendUBX(setNav, sizeof(setNav)/sizeof(uint8_t));
-    gps_set_sucess = getUBX_ACK(setNav);
-    // Timeout after 10 seconds
-    if ((millis() - start_millis) > 10000)
-    {
-      return false;
-    }
-  }
-  gps_set_sucess=0;
-  return gps_set_sucess;
-}
-
-// Poll the NAV5 config and return true if we got it.
-// On success dynModel is set (0..7).
-bool readNav5(uint8_t &dynModel) {
-  // 1) Build & send the read-request (no payload)
-  static const uint8_t pollNav5[] = {
-    0xB5, 0x62,       // UBX header
-    0x06, 0x24,       // class=CFG, id=NAV5
-    0x00, 0x00        // length = 0  → read request
-  };
-  sendUBX(pollNav5, sizeof(pollNav5));
-
-  // 2) Scan for the response header
-  // We'll look for: B5 62 06 24 lenL lenH ... checksum
-  uint32_t deadline = millis() + 1000;
-  enum { SYNC1, SYNC2, CLASS, ID, LEN1, LEN2 } state = SYNC1;
-  uint16_t payloadLen = 0;
-  while (millis() < deadline) {
-    if (!SerGPS.available()) continue;
-    uint8_t b = SerGPS.read();
-    switch (state) {
-      case SYNC1: if (b==0xB5) state=SYNC2; break;
-      case SYNC2: if (b==0x62) state=CLASS; else state=SYNC1; break;
-      case CLASS: if (b==0x06) state=ID; else state=SYNC1; break;
-      case ID:    if (b==0x24) state=LEN1; else state=SYNC1; break;
-      case LEN1:  payloadLen = b; state=LEN2; break;
-      case LEN2:  payloadLen |= (uint16_t(b) << 8); goto HAVE_LEN;
-    }
-  }
-  return false;  
-HAVE_LEN:;
-  if (payloadLen != 36) return false;  // NAV5 payload is always 36 bytes
-
-  // 3) Read the 36-byte payload
-  uint8_t buf[36];
-  for (int i = 0; i < 36; i++) {
-    while (!SerGPS.available() && millis() < deadline);
-    if (millis() >= deadline) return false;
-    buf[i] = SerGPS.read();
-  }
-
-  // 4) Consume checksum (2 bytes)
-  while (SerGPS.available() < 2 && millis() < deadline);
-  SerGPS.read(); SerGPS.read();
-
-  // 5) Byte 6 of the payload is dynModel
-  dynModel = buf[2]; // was 6
-  return true;
-}
-
 bool initGPS() {
-  debugPrintln("GPS: Initializing...");
 
-  // 1) Start serial at default 9600 baud
-  SerGPS.begin(9600);
-  delay(1000);
-  // 2) UBX-CFG-PRT → set UART1 to 115200 baud, 8N1, NMEA+UBX in/out
-  static const uint8_t ubx_cfg_prt[] = {
-    0xB5, 0x62,             // UBX sync
-    0x06, 0x00,             // CFG-PRT
-    0x14, 0x00,             // length = 20
-    0x01,                   // portID = UART1
-    0x00,                   // reserved
-    0x00, 0x00,             // txReady = 0 (no flow control)
-    0xD0, 0x08, 0x00, 0x00, // mode = 0x000008D0 → 8N1
-    0x00, 0xC2, 0x01, 0x00, // baudRate = 115200
-    0x03, 0x00,             // inProtoMask = UBX+NMEA
-    0x03, 0x00,             // outProtoMask = UBX+NMEA
-    0x00, 0x00,             // flags
-    0x00, 0x00              // reserved
-  };
-  sendUBX(ubx_cfg_prt, sizeof(ubx_cfg_prt));
-  delay(1000);    // give the module a moment to respond
-  debugPrintln("GPS: Port set to 115200");
-  // reopen serial at new baud
-  SerGPS.begin(115200);
-  delay(100);
-
-  /*
-   * Turn off unused messages
-   */
-
-  // ------------------------------------------------------
-// Trim NMEA output on UART1 down to only GGA, RMC, ZDA
-// ------------------------------------------------------
-{
-  // 1) Disable everything we don’t parse: GLL(0x01), GSA(0x02), GSV(0x03),
-  //    VTG(0x05), GST(0x07), GNS(0x0D)
-  static const uint8_t nmeaOff[] = { 0x01, 0x02, 0x03, 0x05, 0x07, 0x0D };
-  for (uint8_t msgId : nmeaOff) {
-    // UBX-CFG-MSG (class=0x06,id=0x01,len=3) payload = [0xF0,msgId,0]
-    uint8_t cfg[] = {
-      0xB5, 0x62,             // header
-      0x06, 0x01,             // CFG-MSG
-      0x03, 0x00,             // length = 3
-      0xF0, msgId, 0x00       // NMEA class(0xF0), message ID, rate=0 (off)
-    };
-    sendUBX(cfg, sizeof(cfg));
-    delay(10);
+  if (!myGNSS.begin()) {
+    debugPrintln("GPS not detected. Check I2C wiring.");
+    return false;
   }
 
-  // 2) Enable only GGA(0x00), RMC(0x04), ZDA(0x08) on UART1
-  static const uint8_t nmeaOn[]  = { 0x00, 0x04, 0x08 };
-  for (uint8_t msgId : nmeaOn) {
-    uint8_t cfg[] = {
-      0xB5, 0x62,
-      0x06, 0x01,
-      0x03, 0x00,
-      0xF0, msgId, 0x01       // rate=1 → enabled
-    };
-    sendUBX(cfg, sizeof(cfg));
-    delay(10);
+  debugPrintln("Configuring GPS...");
+  myGNSS.factoryReset();
+  myGNSS.factoryDefault();
+  delay(2000);
+
+  // Set dynamic model to AIRBORNE <4g>
+  if (!myGNSS.setDynamicModel(DYN_MODEL_AIRBORNE2g)) {
+    debugPrintln("Failed to set dynamic model");
+    return false;
   }
-}
 
-  /*
-   * Set dynamic model
-   */
+  // Set UART1 baud rate to 115200
+  myGNSS.setSerialRate(115200, COM_PORT_UART1); // No return value
+  debugPrintln("Set UART1 baud rate to 115200.");
+  SerGPS.begin(GPS_BAUD);
 
-  // drain garbage
-while (SerGPS.available()) SerGPS.read();
 
-static const uint8_t fullNav5[] = {
-  0xB5, 0x62, 0x06, 0x24, 0x24, 0x00,  // header + length=36
-  0xFF, 0xFF,                          // mask = 0xFFFF
-  0x06,                                // dynModel = airborne <1g
-  0x03,                                // fixMode = auto 2D/3D
-  // exactly 32 more bytes of zero/default config
-  0x00,0x00,0x00,0x00,
-  0x10,0x27,0x00,0x00,
-  0x05,0x00,0xFA,0x00,
-  0xFA,0x00,0x64,0x00,
-  0x2C,0x01,0x00,0x00,
-  0x00,0x00,0x00,0x00,
-  0x00,0x00,0x00,0x00,
-  0x00,0x00,0x00,0x00
-};
+  // Set navigation rate to 1 Hz
+  if (!myGNSS.setNavigationFrequency(1))
+  {
+    debugPrintln("Failed to set navigation frequency");
+    return false;
+  }
 
-sendUBX(fullNav5, sizeof(fullNav5));
-delay(200);
-uint8_t actualDyn;
-if (readNav5(actualDyn)) {
-  debugPrint("After full-mask NAV5, dynModel = ");
-  debugPrintln(actualDyn);
-} else {
-  debugPrintln("readNav5() failed");
-}
+  // Disable all common NMEA messages
+  myGNSS.disableNMEAMessage(UBX_NMEA_GLL, COM_PORT_UART1);
+  myGNSS.disableNMEAMessage(UBX_NMEA_GGA, COM_PORT_UART1);
+  myGNSS.disableNMEAMessage(UBX_NMEA_GSA, COM_PORT_UART1);
+  myGNSS.disableNMEAMessage(UBX_NMEA_GSV, COM_PORT_UART1);
+  myGNSS.disableNMEAMessage(UBX_NMEA_VTG, COM_PORT_UART1);
+  myGNSS.disableNMEAMessage(UBX_NMEA_GNS, COM_PORT_UART1);
 
-  // 4) Flush any stray NMEA/UBX bytes
-  while (SerGPS.available()) SerGPS.read();
+  // Enable RMC and ZDA only
+  myGNSS.enableNMEAMessage(UBX_NMEA_RMC, COM_PORT_UART1);
+  myGNSS.enableNMEAMessage(UBX_NMEA_ZDA, COM_PORT_UART1);
+  myGNSS.enableNMEAMessage(UBX_NMEA_GGA, COM_PORT_UART1);
 
-  debugPrintln("GPS: initGPS() complete");
+  UBX_CFG_TP5_data_t timePulseSettings;
+  memset(&timePulseSettings, 0, sizeof(UBX_CFG_TP5_data_t)); // Clear struct
+
+  timePulseSettings.tpIdx = 0;                   // TIMEPULSE pin 0
+  timePulseSettings.version = 0x01;
+  timePulseSettings.flags.bits.active = 1;       // Enable output
+  timePulseSettings.flags.bits.lockedOtherSet = 1; // Align to top of second
+  timePulseSettings.flags.bits.isFreq = 1;       // Frequency mode
+  timePulseSettings.flags.bits.isLength = 1;     // Length is valid
+  //timePulseSettings.flags.bits.pulseDef = 0;     // Pulse is 'time high'
+  timePulseSettings.freqPeriod = 1;              // 1 Hz
+  timePulseSettings.freqPeriodLock = 1;
+  timePulseSettings.pulseLenRatio = 100000;      // 100ms = 100,000 ns
+  timePulseSettings.pulseLenRatioLock = 100000;
+
+  if (!myGNSS.setTimePulseParameters(&timePulseSettings))
+  {
+    debugPrintln("Failed to configure time pulse!");
+  }
+  else
+  {
+    debugPrintln("Time pulse configured.");
+  }
+
+  // Save settings
+  if (!myGNSS.saveConfiguration())
+  {
+    debugPrintln("Failed to save configuration!");
+    return false;
+  }
+  else
+  {
+    debugPrintln("GPS configuration saved.");
+  }
+
+  debugPrintln("Setup complete. GPS will output RMC/ZDA/GGA at 115200 baud over UART1.");
   return true;
 }
 
@@ -813,6 +602,10 @@ void rolloverFileIfNeeded() {
 // Flush pending log entries to the SD card
 // ------------------------------------------------------
 void flushLog() {
+  if (logBuf.size() < 100) {
+    debugPrintln("flushLog: Not enough entries to flush");
+    return;
+  }
   LogEntry entry;
 
   // 1) Stop ADC interrupts so the ISR can't steal SPI during any of our writes
@@ -866,15 +659,13 @@ void flushLog() {
   attachInterrupt(digitalPinToInterrupt(PIN_ADC_DRDY), adcISR, FALLING);
 }
 
-
 // ------------------------------------------------------
 // Top-level Arduino setup()
 // ------------------------------------------------------
 void setup() {
 
   SerDebug.begin(DEBUG_BAUD);
-  SerGPS.begin(GPS_BAUD_START);
-
+  delay(100);
   #ifdef WATCHDOG_ENABLE
     debugPrintln("Starting watchdog...");
     IWatchdog.begin(26000000);    // max ~26 208 000 µs  
@@ -896,12 +687,14 @@ void setup() {
   digitalWrite(PIN_ADC_CS, HIGH); // ensure ADC CS is high
   digitalWrite(PIN_SD_CS, HIGH);   // ensure SD CS is high
 
-
+  delay(50);
   debugPrintln("Initializing SPI...");
   SPI.begin();
+  delay(50);
   debugPrintln("Initializing I2C...");
   Wire.begin();
   Wire.setClock(400000);
+  delay(100);
 
   bool ok = true;
   
@@ -910,6 +703,8 @@ void setup() {
     debugPrintln("failed");
     ok = false;
   } else debugPrintln("ok");
+
+  delay(10);
   
   debugPrint("Initializing IMU... ");
   if (!initIMU()) {
@@ -917,17 +712,23 @@ void setup() {
     ok = false;
   } else debugPrintln("ok");
   
+  delay(10);
+
   debugPrint("Initializing BME688... ");
   if (!initBME()) {
     debugPrintln("failed");
     ok = false;
   } else debugPrintln("ok");
   
+  delay(10);
+
   debugPrint("Initializing GPS... ");
-  if (!initGPS()) {
-    debugPrintln("failed");
-    ok = false;
+   if (!initGPS()) {
+      debugPrintln("failed");
+      ok = false;
   } else debugPrintln("ok");
+
+  delay(10);
 
   debugPrint("Initializing SD card... ");
   if (!initSD()) {
@@ -935,14 +736,20 @@ void setup() {
     ok = false;
   } else debugPrintln("ok");
   
+  delay(10);
+
   debugPrint("Testing SD write... ");
   if (!testSDwrite()) {
     debugPrintln("failed");
     ok = false;
   } else debugPrintln("ok");
   
+  delay(10);
+
   debugPrintln("Setting up GPS PPS Interrupt...");
   attachInterrupt(digitalPinToInterrupt(PIN_GPS_PPS), ppsISR, RISING);
+
+  delay(10);
 
   debugPrintln("Setting up ADC Interrupt...");
   attachInterrupt(digitalPinToInterrupt(PIN_ADC_DRDY), adcISR, FALLING);
@@ -956,6 +763,7 @@ void setup() {
     while (1) {setLED(255, 0, 0); delay(100); setLED(0, 0, 0); delay(100);} // blink red
   }
 
+  #ifdef WAIT_ON_GPS_FIX
   debugPrintln("Waiting for GPS lock...");
   runtime.currentState = RuntimeStatus::STATE_ACQUIRING_GPS;
   updateLED();
@@ -965,7 +773,8 @@ void setup() {
       IWatchdog.reload();
     #endif
   }
-  
+  #endif
+
   runtime.currentState = RuntimeStatus::STATE_LOGGING;
   updateLED();
   debugPrintln("GPS lock acquired... setup complete");
@@ -975,20 +784,22 @@ void setup() {
 void loop() {
 
   pollGPS();
-  //debugPrintln("loop: pollgps returned");
+  debugPrintln("loop: pollgps returned");
   
   if (millis() - lastLfLogMs >= 1000) {
+    debugPrintln("loop: calling logLowFreqFields");
     logLowFreqFields();
+     debugPrintln("loop: returned from logLowFreqFields");
     lastLfLogMs = millis();
-    //debugPrintln("loop: LF read returned");
+    debugPrintln("loop: LF read returned");
   }
 
   rolloverFileIfNeeded();
-  //debugPrintln("loop: rolloverfile returned");
+  debugPrintln("loop: rolloverfile returned");
   flushLog();
-  //debugPrintln("loop: flushLog returned");
+  debugPrintln("loop: flushLog returned");
   updateLED();
-  //debugPrintln("loop: updateLED returned");
+  debugPrintln("loop: updateLED returned");
 
   #ifdef WATCHDOG_ENABLE
     IWatchdog.reload();
