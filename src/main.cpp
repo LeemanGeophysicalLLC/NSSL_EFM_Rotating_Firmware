@@ -9,6 +9,8 @@
 #include "IWatchdog.h"
 #include "ADS131M04.h"
 #include "SparkFun_u-blox_GNSS_Arduino_Library.h"
+#include <math.h>   // for lroundf
+#include <limits.h> // for INT16_MIN
 
 // Uncomment to enable debug prints
 //#define DEBUG_PRINT_ENABLE
@@ -165,12 +167,23 @@ void logLowFreqFields() {
   // 3) BME280 readings (Adafruit_BME280)
   debugPrintln("logLowFreqFields: Getting BME readings");
 
-  // TODO - Uncomment and use BME readings
-  bme.performReading();
-  rec.temp     = int16_t(bme.temperature * 10);            // ×10 fixed-point
-  float p_hPa = bme.pressure / 100.0f;
-  rec.pressure = int16_t(p_hPa * 10);
-  rec.humidity = int16_t(bme.humidity * 10);
+  if (bme.performReading()) {
+    // Temperature (°C) ×10
+    rec.temp = (int16_t)lroundf(bme.temperature * 10.0f);
+
+    // Pressure is in Pa -> convert to hPa, then ×10
+    float p_hPa = bme.pressure / 100.0f;
+    rec.pressure = (int16_t)lroundf(p_hPa * 10.0f);
+
+    // Humidity (%RH) ×10
+    rec.humidity = (int16_t)lroundf(bme.humidity * 10.0f);
+  } else {
+    // Reading failed: mark clearly (you can also keep prior values if you prefer)
+    rec.temp     = INT16_MIN;
+    rec.pressure = INT16_MIN;
+    rec.humidity = INT16_MIN;
+    debugPrintln("BME680: performReading() failed");
+  }
 
   debugPrint("Temperature: ");
   debugPrint(rec.temp / 10.0); // Print temperature in °C
