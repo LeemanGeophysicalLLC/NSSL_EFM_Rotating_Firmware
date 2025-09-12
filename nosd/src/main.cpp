@@ -124,6 +124,9 @@ struct RuntimeStatus {
   bool gpsLocked = false;                       ///< GPS has valid time and PPS sync
   bool gpsError = false;                        ///< GPS timeout occurred
   bool logError = false;                        ///< SD card write or open failure
+  uint32_t utc_hhmmss00 = 0;   // hhmmss00 (centiseconds=00)
+  bool     utcValid = false;   // have we ever parsed a valid NMEA time?
+
 
   /**
    * @brief High-level system state.
@@ -139,6 +142,15 @@ RuntimeStatus runtime;
 // Buffer for up to 256 entries
 static CircularBuffer<LogEntry, 128> logBuf;
 
+static inline uint32_t bump_hhmmss00(uint32_t t) {
+  uint8_t hh = (t / 1000000UL) % 100;
+  uint8_t mm = (t / 10000UL)   % 100;
+  uint8_t ss = (t / 100UL)     % 100;  // cc stays 00 for us
+  ss++;
+  if (ss == 60) { ss = 0; mm++; if (mm == 60) { mm = 0; hh = (hh + 1) % 24; } }
+  return (uint32_t)hh * 1000000UL + (uint32_t)mm * 10000UL + (uint32_t)ss * 100UL;
+}
+
 // ------------------------------------------------------
 // Low-frequency sampling (1 Hz): GPS + BME → LFRecord
 // ------------------------------------------------------
@@ -146,7 +158,7 @@ void logLowFreqFields() {
   debugPrintln("logLowFreqFields: Starting LF record logging");
   // 1) Build a fresh LFRecord
   LFRecord rec{};
-  rec.pps_utc   = runtime.lastUTC;
+  rec.pps_utc = runtime.utc_hhmmss00;
   rec.ms_offset = millis() - runtime.ppsMillis;
   rec.processor_ms = millis();
 
@@ -276,9 +288,13 @@ void pollGPS() {
     if (gps.encode(c)) {
       // Always keep lastUTC fresh when valid
       if (gps.time.isValid()) {
-        runtime.lastUTC = gps.time.value();  // e.g., 17495100 for 17:49:51.00
+        uint32_t nmea = gps.time.value();       // hhmmsscc
+        // snap our counter to NMEA, forcing cc to 00
+        runtime.utc_hhmmss00 = (nmea / 100U) * 100U;
+        runtime.utcValid = true;
         runtime.gpsLastValidMillis = millis();
       }
+
       // Align millis to the top-of-second when we see PPS
       if (isGPSLocked() && runtime.ppsSeen) {
         runtime.gpsEpochMillis = runtime.ppsMillis; // millisecond 0 of current second
@@ -297,10 +313,12 @@ void pollGPS() {
 void ppsISR() {
   runtime.ppsMillis = millis();
   runtime.ppsSeen   = true;
-  if (runtime.gpsLocked) {
-    flag_read_lf = true;
+  if (runtime.gpsLocked && runtime.utcValid) {
+    runtime.utc_hhmmss00 = bump_hhmmss00(runtime.utc_hhmmss00);
   }
+  flag_read_lf = true;
 }
+
 
 // ------------------------------------------------------
 // ADC DRDY ISR: sample ADS131M04 at 250 Hz, keep 1/5 → 50 Hz
@@ -311,7 +329,9 @@ void adcISR() {
     ready_cnt = 0;
     flag_read_hf = true;
     adc_ms = millis();
-    adc_pps_offset = adc_ms - runtime.ppsMillis;  // ms since last PPS
+    //adc_pps_offset = adc_ms - runtime.ppsMillis;  // ms since last PPS
+    adc_pps_offset = (adc_ms - runtime.ppsMillis + 1000) % 1000;  // 0..999
+
   }
 }
 
@@ -362,7 +382,7 @@ bool initIMU()
                   // gpm8
                   // gpm16
 
-  myFSS.g = dps250; // (ICM_20948_GYRO_CONFIG_1_FS_SEL_e)
+  myFSS.g = dps2000; // (ICM_20948_GYRO_CONFIG_1_FS_SEL_e)
                     // dps250
                     // dps500
                     // dps1000
@@ -417,8 +437,9 @@ bool initGPS() {
   // Set UART1 baud rate to 115200
   myGNSS.setSerialRate(115200, COM_PORT_UART1); // No return value
   debugPrintln("Set UART1 baud rate to 115200.");
+  delay(100);
   SerGPS.begin(GPS_BAUD);
-
+  delay(100);
 
   // Set navigation rate to 1 Hz
   if (!myGNSS.setNavigationFrequency(1))
@@ -486,7 +507,7 @@ bool initGPS() {
 void setup() {
 
   SerDebug.begin(DEBUG_BAUD);
-  delay(100);
+  delay(500);
   #ifdef WATCHDOG_ENABLE
     debugPrintln("Starting watchdog...");
     IWatchdog.begin(26000000);    // max ~26 208 000 µs  
@@ -515,7 +536,7 @@ void setup() {
   debugPrintln("Initializing I2C...");
   Wire.begin();
   Wire.setClock(400000);
-  delay(100);
+  delay(300);
 
   bool ok = true;
   
@@ -668,7 +689,7 @@ void readHFSensors()
   adcOutput tmp = adc.readADC();  // one SPI read per decimated sample
 
   HFRecord rec{};
-  rec.pps_utc      = runtime.lastUTC;                 // (see note below)
+  rec.pps_utc = runtime.utc_hhmmss00;
   rec.ms_offset    = adc_pps_offset;              // *** exact 20 ms grid ***
   rec.processor_ms = adc_ms;
 
@@ -694,7 +715,7 @@ void readLFSensors()
 {
   // 1) Build a fresh LFRecord
   LFRecord rec{};
-  rec.pps_utc   = runtime.lastUTC;
+  rec.pps_utc = runtime.utc_hhmmss00;
   rec.ms_offset = millis() - runtime.ppsMillis;
   rec.processor_ms = millis();
 
