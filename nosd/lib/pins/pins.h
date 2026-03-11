@@ -20,6 +20,6 @@ const uint8_t PIN_LED_BLUE = PA8;
 const uint8_t PIN_XBEE_TX = PA9;
 const uint8_t PIN_XBEE_RX = PA10;
 const uint8_t PIN_ADC_RESET = PA15;
-const uint8_t PIN_OPENLOG_DET = PB4;
+const uint8_t PIN_OPENLOG_DET = PB15;
 
 #endif

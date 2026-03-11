@@ -138,9 +138,74 @@ struct RuntimeStatus {
     STATE_ERROR          ///< Error state due to sensor, GPS, or SD failure
   } currentState = STATE_ACQUIRING_GPS;
 };
+
+// ==================== Forward Declarations ====================
+static inline bool isLeap(uint16_t y);
+static inline uint32_t bump_yyyymmdd(uint32_t d);
+static inline uint32_t bump_hhmmss00(uint32_t t);
+
+static inline void addSecondsPacked(uint32_t &date, uint32_t &time, uint32_t addSec);
+static bool computeStampFromAnchor(uint32_t sample_ms,
+                                   uint32_t &outDate,
+                                   uint32_t &outTime,
+                                   uint32_t &outMsOff);
+
+void setLED(uint8_t r, uint8_t g, uint8_t b);
+void updateLED();
+void startupLedSequence();
+
+bool isGPSLocked();
+void pollGPS();
+void ppsISR();
+void adcISR();
+
+bool initADC();
+bool initIMU();
+bool initBME();
+bool initGPS();
+
+static int formatLine(const LogEntry &e, char *out, size_t cap);
+static void drainSerial();
+
+void readHFSensors();
+void readLFSensors();
+
+
 RuntimeStatus runtime;
 
 static CircularBuffer<LogEntry, 128> logBuf;
+
+/**
+ * @brief Increment a packed date (YYYYMMDD) by exactly one day.
+ *
+ * Parses the input into year/month/day, advances the day, and rolls month/year
+ * as needed, accounting for month lengths and leap years (via isLeap()).
+ *
+ * @param d  Packed date as YYYYMMDD (e.g., 20250912).
+ * @return   Next calendar day as YYYYMMDD (e.g., 20250913).
+ *
+ * @note Expects a valid Gregorian date with 1 ≤ month ≤ 12 and a day within
+ *       that month. February is treated as 29 days on leap years.
+ * @code
+ *   bump_yyyymmdd(20240228) -> 20240229
+ *   bump_yyyymmdd(20240229) -> 20240301
+ *   bump_yyyymmdd(20231231) -> 20240101
+ * @endcode
+ */
+static inline uint32_t bump_yyyymmdd(uint32_t d) {
+  uint16_t y = d / 10000U;
+  uint8_t  m = (d / 100U) % 100U;
+  uint8_t  day = d % 100U;
+
+  static const uint8_t mdays[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+  uint8_t dim = mdays[(m ? m : 1) - 1];
+  if (m == 2 && isLeap(y)) dim = 29;
+
+  day++;
+  if (day > dim) { day = 1; m++; if (m > 12) { m = 1; y++; } }
+
+  return (uint32_t)y * 10000UL + (uint32_t)m * 100UL + (uint32_t)day;
+}
 
 /**
  * @brief Bump a packed UTC time (hhmmsscc) forward by exactly one second.
@@ -179,6 +244,43 @@ static inline uint32_t bump_hhmmss00(uint32_t t) {
   return (uint32_t)hh * 1000000UL + (uint32_t)mm * 10000UL + (uint32_t)ss * 100UL;
 }
 
+static inline void addSecondsPacked(uint32_t &date, uint32_t &time, uint32_t addSec) {
+  while (addSec--) {
+    uint32_t prev = time;
+    time = bump_hhmmss00(time);
+    if (prev == 23595900U) {
+      date = bump_yyyymmdd(date);
+    }
+  }
+}
+
+static bool computeStampFromAnchor(uint32_t sample_ms,
+                                   uint32_t &outDate,
+                                   uint32_t &outTime,
+                                   uint32_t &outMsOff)
+{
+  uint32_t epochMs, date0, time0;
+  bool have;
+
+  noInterrupts();
+  have   = runtime.haveTimeAnchor;
+  epochMs = runtime.gpsEpochMillis;
+  date0   = runtime.dateAtLastPps_yyyymmdd;
+  time0   = runtime.utcAtLastPps_hhmmss00;
+  interrupts();
+
+  if (!have) return false;
+
+  uint32_t dms = sample_ms - epochMs;     // unsigned wrap-safe
+  uint32_t addSec = dms / 1000UL;
+  outMsOff = dms % 1000UL;
+
+  outDate = date0;
+  outTime = time0;
+  addSecondsPacked(outDate, outTime, addSec);
+  return true;
+}
+
 /**
  * @brief Determine if a given year is a leap year (Gregorian calendar).
  *
@@ -192,38 +294,6 @@ static inline uint32_t bump_hhmmss00(uint32_t t) {
  */
 static inline bool isLeap(uint16_t y) {
   return ((y % 4 == 0) && (y % 100 != 0)) || (y % 400 == 0);
-}
-
-/**
- * @brief Increment a packed date (YYYYMMDD) by exactly one day.
- *
- * Parses the input into year/month/day, advances the day, and rolls month/year
- * as needed, accounting for month lengths and leap years (via isLeap()).
- *
- * @param d  Packed date as YYYYMMDD (e.g., 20250912).
- * @return   Next calendar day as YYYYMMDD (e.g., 20250913).
- *
- * @note Expects a valid Gregorian date with 1 ≤ month ≤ 12 and a day within
- *       that month. February is treated as 29 days on leap years.
- * @code
- *   bump_yyyymmdd(20240228) -> 20240229
- *   bump_yyyymmdd(20240229) -> 20240301
- *   bump_yyyymmdd(20231231) -> 20240101
- * @endcode
- */
-static inline uint32_t bump_yyyymmdd(uint32_t d) {
-  uint16_t y = d / 10000U;
-  uint8_t  m = (d / 100U) % 100U;
-  uint8_t  day = d % 100U;
-
-  static const uint8_t mdays[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
-  uint8_t dim = mdays[(m ? m : 1) - 1];
-  if (m == 2 && isLeap(y)) dim = 29;
-
-  day++;
-  if (day > dim) { day = 1; m++; if (m > 12) { m = 1; y++; } }
-
-  return (uint32_t)y * 10000UL + (uint32_t)m * 100UL + (uint32_t)day;
 }
 
 
@@ -317,28 +387,30 @@ void pollGPS() {
   while (SerGPS.available()) {
     char c = SerGPS.read();
     if (gps.encode(c)) {
-      // Always keep lastUTC fresh when valid
-      if (gps.time.isValid()) {
-        uint32_t nmea = gps.time.value();       // hhmmsscc
-        // snap our counter to NMEA, forcing cc to 00
-        runtime.utc_hhmmss00 = (nmea / 100U) * 100U;
-        runtime.utcValid = true;
-        runtime.gpsLastValidMillis = millis();
-      }
+      if (isGPSLocked() && runtime.ppsSeen && gps.date.isValid() && gps.time.isValid()) {
 
-      if (gps.date.isValid()) {
-        // TinyGPS++ gives full year/month/day
         uint16_t y = gps.date.year();
         uint8_t  m = gps.date.month();
         uint8_t  d = gps.date.day();
-        runtime.utc_yyyymmdd = (uint32_t)y * 10000UL + (uint32_t)m * 100UL + (uint32_t)d;
-        runtime.dateValid = true;
-      }
+        uint32_t yyyymmdd = (uint32_t)y * 10000UL + (uint32_t)m * 100UL + (uint32_t)d;
 
-      // Align millis to the top-of-second when we see PPS
-      if (isGPSLocked() && runtime.ppsSeen) {
-        runtime.gpsLocked      = true;
-        runtime.ppsSeen        = false;
+        // TinyGPS++ gives hour/min/sec directly (better than value()/100 tricks)
+        uint32_t hhmmss00 =
+            (uint32_t)gps.time.hour()   * 1000000UL +
+            (uint32_t)gps.time.minute() * 10000UL +
+            (uint32_t)gps.time.second() * 100UL;
+
+        // Latch the UTC second + the millis at the PPS edge
+        noInterrupts();
+        runtime.dateAtLastPps_yyyymmdd = yyyymmdd;
+        runtime.utcAtLastPps_hhmmss00  = hhmmss00;
+        runtime.gpsEpochMillis         = runtime.ppsMillis;
+        runtime.haveTimeAnchor         = true;
+        runtime.ppsSeen                = false;
+        interrupts();
+
+        runtime.gpsLocked = true;
+        runtime.gpsLastValidMillis = millis();
       }
     }
   }
@@ -352,19 +424,8 @@ void pollGPS() {
 void ppsISR() {
   runtime.ppsMillis = millis();
   runtime.ppsSeen   = true;
-
-  if (runtime.gpsLocked && runtime.utcValid) {
-    const uint32_t prev = runtime.utc_hhmmss00;
-    runtime.utc_hhmmss00 = bump_hhmmss00(runtime.utc_hhmmss00);
-
-    // If we just rolled over 23:59:59 → 00:00:00, bump date too
-    if (prev == 23595900U && runtime.dateValid) {
-      runtime.utc_yyyymmdd = bump_yyyymmdd(runtime.utc_yyyymmdd);
-    }
-  }
-  flag_read_lf = true;
+  flag_read_lf      = true;
 }
-
 
 
 // ------------------------------------------------------------
@@ -696,21 +757,22 @@ void setup() {
     while (1) {setLED(255, 0, 0); delay(100); setLED(0, 0, 0); delay(100);} // blink red
   }
 
+  SerLog.println("# Setting up GPS PPS Interrupt...");
+  attachInterrupt(digitalPinToInterrupt(PIN_GPS_PPS), ppsISR, RISING);
+  delay(10);
+
   #ifdef WAIT_ON_GPS_FIX
   SerLog.println("# Waiting for GPS lock...");
   runtime.currentState = RuntimeStatus::STATE_ACQUIRING_GPS;
   updateLED();
-  while (!isGPSLocked()) {
+  while (!runtime.haveTimeAnchor) {
     pollGPS();
-    delay(100);
+    delay(10);
     #ifdef WATCHDOG_ENABLE
       IWatchdog.reload();
     #endif
   }
   #endif
-
-  SerLog.println("# Setting up GPS PPS Interrupt...");
-  attachInterrupt(digitalPinToInterrupt(PIN_GPS_PPS), ppsISR, RISING);
 
   delay(10);
 
@@ -727,7 +789,7 @@ void setup() {
     SerLog.println("# Watchdog running");
   #endif
 
-  SerLog.println("# type,hhmmss00,msOff_from_pps,processor_ms,efield_raw,analog_acc_x_raw,analog_acc_y_raw,analog_acc_z_raw,ax_mg,ay_mg,az_mg,gx_dps10,gy_dps10,gz_dps10,mx_nT,my_nT,mz_nT  # type=1 (HF)");
+  SerLog.println("# type,hhmmss00,msOff_from_pps,processor_ms,efield_raw,analog_acc_x_raw,analog_acc_y_raw,analog_acc_z_raw,ax_ug,ay_ug,az_ug,gx_dps10,gy_dps10,gz_dps10,mx_nT,my_nT,mz_nT  # type=1 (HF)");
   SerLog.println("# type,YYYYMMDDThhmmss00,msOff_ms,processor_ms,lat_e5,lon_e5,alt_m,temp_c_x10,press_hPa_x10,hum_%_x10 # type=2 (LF)");
 }
 
@@ -859,9 +921,16 @@ void readHFSensors()
   adcOutput tmp = adc.readADC();  // one SPI read per decimated sample
 
   HFRecord rec{};
-  rec.pps_utc = runtime.utc_hhmmss00;
-  rec.ms_offset = adc_pps_offset;
   rec.processor_ms = adc_ms;
+
+  uint32_t d, t, ms;
+  if (computeStampFromAnchor(rec.processor_ms, d, t, ms)) {
+    rec.pps_utc   = t;
+    rec.ms_offset = ms;
+  } else {
+    rec.pps_utc = 0;
+    rec.ms_offset = 0;
+  }
 
   rec.adc[0] = tmp.ch0;
   rec.adc[1] = tmp.ch1;
@@ -908,10 +977,18 @@ void readLFSensors()
 {
   // 1) Build a fresh LFRecord
   LFRecord rec{};
-  rec.pps_utc = runtime.utc_hhmmss00;
-  rec.pps_date   = runtime.utc_yyyymmdd;
-  rec.ms_offset = (millis() - runtime.ppsMillis + 1000) % 1000;
   rec.processor_ms = millis();
+
+  uint32_t d, t, ms;
+  if (computeStampFromAnchor(rec.processor_ms, d, t, ms)) {
+    rec.pps_date  = d;
+    rec.pps_utc   = t;
+    rec.ms_offset = ms;
+  } else {
+    rec.pps_date = 0;
+    rec.pps_utc = 0;
+    rec.ms_offset = 0;
+  }
 
   // 2) GPS position & altitude (TinyGPS++)
   debugPrintln("readLFSensors: Getting GPS position and altitude");
